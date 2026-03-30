@@ -6,26 +6,24 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ── Config (set these as environment variables) ──────────────────────────────
-GITLAB_TOKEN   = os.environ.get("GITLAB_TOKEN")        # Personal Access Token, scope: api
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")  # Secret token you set in GitLab
+GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY")
-GITLAB_URL     = os.environ.get("GITLAB_URL", "https://gitlab.com")
 
 SYSTEM_PROMPT = """You are an External Prefrontal Cortex for software developers with ADHD.
-Your sole purpose is Task Atomicization: transforming a vague GitLab Issue into a
+Your sole purpose is Task Atomicization: transforming a vague GitHub Issue into a
 psychologically safe, executable action plan.
 
 RULES:
-1. Every sub-task ≤ 15 minutes, completable alone right now.
+1. Every sub-task must be completable in 15 minutes or less, alone, right now.
 2. Each task starts with ONE concrete verb: Open, Read, Write, Run, Add, Check, Delete, Search.
-   FORBIDDEN: Implement, Handle, Manage, Fix, Deal with.
+   FORBIDDEN verbs: Implement, Handle, Manage, Fix, Deal with.
 3. Every task ends with: ✓ Done when: [specific observable outcome]
 4. If labels contain Critical/P0/Blocker/Security — one calm sentence acknowledging it, then decompose normally.
-5. Maximum 8 tasks. If more needed, split into "Start here →" and "After your break →".
-6. Blockers (needs another person) go in a separate section.
+5. Maximum 8 tasks total. If more needed, split into "Start here →" and "After your break →".
+6. Anything requiring another person goes in the Blockers section.
 
-OUTPUT FORMAT — return ONLY this, no preamble:
+OUTPUT FORMAT — return ONLY this structure, no preamble:
 
 ---
 **[Reframed action-oriented title — max 10 words]**
@@ -40,7 +38,7 @@ OUTPUT FORMAT — return ONLY this, no preamble:
 - [ ] Verb specific-object — ✓ Done when: observable outcome
 
 🔒 **Blockers (waiting on others):**
-- [omit section entirely if none]
+- [omit this section entirely if none]
 ---
 
 Tone: direct, warm, precise. Like a trusted senior colleague leaving a quiet note."""
@@ -49,10 +47,8 @@ Tone: direct, warm, precise. Like a trusted senior colleague leaving a quiet not
 def verify_signature(payload: bytes, signature: str) -> bool:
     if not WEBHOOK_SECRET:
         return True
-    expected = hmac.new(
-        WEBHOOK_SECRET.encode(), payload, hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(f"sha256={expected}", signature or "")
+    mac = hmac.new(WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(f"sha256={mac}", signature or "")
 
 
 def call_claude(issue_text: str) -> str:
@@ -67,7 +63,7 @@ def call_claude(issue_text: str) -> str:
             "model": "claude-sonnet-4-20250514",
             "max_tokens": 1000,
             "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": f"GitLab Issue:\n\n{issue_text}"}],
+            "messages": [{"role": "user", "content": f"GitHub Issue:\n\n{issue_text}"}],
         },
         timeout=30,
     )
@@ -75,11 +71,14 @@ def call_claude(issue_text: str) -> str:
     return resp.json()["content"][0]["text"]
 
 
-def post_note(project_id: int | str, issue_iid: int, body: str):
-    url = f"{GITLAB_URL}/api/v4/projects/{project_id}/issues/{issue_iid}/notes"
+def post_github_comment(owner: str, repo: str, issue_number: int, body: str):
+    url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments"
     resp = requests.post(
         url,
-        headers={"PRIVATE-TOKEN": GITLAB_TOKEN},
+        headers={
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+        },
         json={"body": body},
         timeout=15,
     )
@@ -89,57 +88,51 @@ def post_note(project_id: int | str, issue_iid: int, body: str):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # ── 1. Verify signature ───────────────────────────────────────────────
+    # 1. Verify signature
     raw = request.get_data()
-    sig = request.headers.get("X-Gitlab-Token", "")
-    # GitLab sends the secret token directly (not HMAC), so compare plaintext
-    if WEBHOOK_SECRET and sig != WEBHOOK_SECRET:
+    sig = request.headers.get("X-Hub-Signature-256", "")
+    if WEBHOOK_SECRET and not verify_signature(raw, sig):
         return jsonify({"error": "unauthorized"}), 401
 
     payload = request.get_json(force=True, silent=True) or {}
 
-    # ── 2. Filter: only act on issue assignment events ────────────────────
-    event = request.headers.get("X-Gitlab-Event", "")
-    if event not in ("Issue Hook", "Work Item Hook"):
-        return jsonify({"status": "ignored", "event": event}), 200
-
-    action   = payload.get("object_attributes", {}).get("action", "")
-    assignees = payload.get("assignees", [])
-
-    # Trigger on: issue opened OR just assigned
-    if action not in ("open", "update") or not assignees:
+    # 2. Only handle issue assignment
+    action = payload.get("action", "")
+    if action != "assigned":
         return jsonify({"status": "ignored", "action": action}), 200
 
-    # ── 3. Extract issue content ──────────────────────────────────────────
-    attrs       = payload["object_attributes"]
-    title       = attrs.get("title", "")
-    description = attrs.get("description", "") or ""
-    labels      = " ".join(l.get("title", "") for l in payload.get("labels", []))
-    issue_iid   = attrs["iid"]
-    project_id  = payload["project"]["id"]
+    # 3. Extract issue content
+    issue      = payload.get("issue", {})
+    title      = issue.get("title", "")
+    body       = issue.get("body", "") or ""
+    labels     = " ".join(l.get("name", "") for l in issue.get("labels", []))
+    number     = issue.get("number")
+    repo_info  = payload.get("repository", {})
+    owner      = repo_info.get("owner", {}).get("login", "")
+    repo_name  = repo_info.get("name", "")
 
-    issue_text = f"Title: {title}\nLabels: {labels}\n\nDescription:\n{description}"
+    issue_text = f"Title: {title}\nLabels: {labels}\n\nDescription:\n{body}"
 
-    # ── 4. Atomicize via Claude ───────────────────────────────────────────
+    # 4. Atomicize via Claude
     try:
         atomicized = call_claude(issue_text)
     except Exception as e:
         return jsonify({"error": f"Claude API failed: {e}"}), 500
 
-    # ── 5. Post back to GitLab as a note ─────────────────────────────────
+    # 5. Post back as GitHub comment
     note_body = (
         "### 🧠 Cognitive Orthotic — Task Breakdown\n\n"
         + atomicized
-        + "\n\n---\n*Generated by Cognitive Orthotic Agent · "
-          "[What is this?](https://github.com/yourrepo)*"
+        + "\n\n---\n*Generated by [Cognitive Orthotic](https://github.com/"
+        + owner + "/cognitive-orthotic) · External prefrontal cortex for ADHD developers*"
     )
 
     try:
-        post_note(project_id, issue_iid, note_body)
+        post_github_comment(owner, repo_name, number, note_body)
     except Exception as e:
-        return jsonify({"error": f"GitLab note failed: {e}"}), 500
+        return jsonify({"error": f"GitHub comment failed: {e}"}), 500
 
-    return jsonify({"status": "ok", "issue": issue_iid}), 200
+    return jsonify({"status": "ok", "issue": number}), 200
 
 
 @app.route("/health", methods=["GET"])
