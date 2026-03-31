@@ -6,9 +6,9 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN")
+GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 SYSTEM_PROMPT = """You are an External Prefrontal Cortex for software developers with ADHD.
 Your sole purpose is Task Atomicization: transforming a vague GitHub Issue into a
@@ -51,24 +51,19 @@ def verify_signature(payload: bytes, signature: str) -> bool:
     return hmac.compare_digest(f"sha256={mac}", signature or "")
 
 
-def call_claude(issue_text: str) -> str:
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 1000,
-            "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": f"GitHub Issue:\n\n{issue_text}"}],
-        },
-        timeout=30,
+def call_gemini(issue_text: str) -> str:
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     )
+    body = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"parts": [{"text": f"GitHub Issue:\n\n{issue_text}"}]}],
+        "generationConfig": {"maxOutputTokens": 1000, "temperature": 0.3},
+    }
+    resp = requests.post(url, json=body, timeout=30)
     resp.raise_for_status()
-    return resp.json()["content"][0]["text"]
+    return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
 
 
 def post_github_comment(owner: str, repo: str, issue_number: int, body: str):
@@ -113,11 +108,11 @@ def webhook():
 
     issue_text = f"Title: {title}\nLabels: {labels}\n\nDescription:\n{body}"
 
-    # 4. Atomicize via Claude
+    # 4. Atomicize via Gemini
     try:
-        atomicized = call_claude(issue_text)
+        atomicized = call_gemini(issue_text)
     except Exception as e:
-        return jsonify({"error": f"Claude API failed: {e}"}), 500
+        return jsonify({"error": f"Gemini API failed: {e}"}), 500
 
     # 5. Post back as GitHub comment
     note_body = (
