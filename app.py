@@ -54,8 +54,7 @@ def verify_signature(payload: bytes, signature: str) -> bool:
 def call_gemini(issue_text: str) -> str:
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-    )
+f"gemini-2.0-flash-lite:generateContent?key={GEMINI_API_KEY}"    )
     body = {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": [{"parts": [{"text": f"GitHub Issue:\n\n{issue_text}"}]}],
