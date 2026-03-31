@@ -52,18 +52,23 @@ def verify_signature(payload: bytes, signature: str) -> bool:
 
 
 def call_gemini(issue_text: str) -> str:
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-f"gemini-2.0-flash-lite:generateContent?key={GEMINI_API_KEY}"    )
-    body = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"parts": [{"text": f"GitHub Issue:\n\n{issue_text}"}]}],
-        "generationConfig": {"maxOutputTokens": 1000, "temperature": 0.3},
-    }
-    resp = requests.post(url, json=body, timeout=30)
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": os.environ.get("ANTHROPIC_API_KEY"),
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 1000,
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": f"GitHub Issue:\n\n{issue_text}"}],
+        },
+        timeout=30,
+    )
     resp.raise_for_status()
-    return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-
+    return resp.json()["content"][0]["text"]
 
 def post_github_comment(owner: str, repo: str, issue_number: int, body: str):
     url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments"
